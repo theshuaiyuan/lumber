@@ -1,9 +1,10 @@
 ;;; lumber.el --- Log analysis pattern manager -*- lexical-binding: t -*-
 
 ;; Author: shuaiy
+;; Version: 0.1.0
 ;; Package-Requires: ((emacs "29.1") (transient "0.6"))
 ;; Keywords: tools, matching, logs
-;; URL: TBD
+;; URL: https://github.com/theshuaiyuan/lumber
 
 ;;; Commentary:
 ;; Lumber manages color-coded search patterns for log file analysis.
@@ -156,7 +157,8 @@ pattern string with \\(?i:...\\) manually if the regexp engine supports it."
 ;;;; Combined Regexp
 
 (defun lumber--build-combined-regexp ()
-  "Build a combined regexp from all enabled patterns joined with \\| (Emacs syntax)."
+  "Build a combined regexp from all enabled patterns.
+Uses \\| (Emacs regexp syntax) as alternation."
   (let ((enabled (cl-remove-if-not
                   (lambda (p) (plist-get p :enabled))
                   lumber--patterns)))
@@ -164,7 +166,8 @@ pattern string with \\(?i:...\\) manually if the regexp engine supports it."
       (mapconcat #'lumber--pattern-to-regexp enabled "\\|"))))
 
 (defun lumber--build-grep-regexp ()
-  "Build a combined regexp for external tools using | (POSIX ERE / PCRE) as alternation."
+  "Build a combined regexp for external tools.
+Uses | (POSIX ERE / PCRE) as alternation."
   (let ((enabled (cl-remove-if-not
                   (lambda (p) (plist-get p :enabled))
                   lumber--patterns)))
@@ -196,8 +199,9 @@ pattern string with \\(?i:...\\) manually if the regexp engine supports it."
 ;;;; Color Assignment
 
 (defun lumber--next-color ()
-  "Return the next (foreground . background) color pair from `lumber-default-colors'.
-Cycles through, preferring pairs not already in use."
+  "Return the next color pair from `lumber-default-colors'.
+Color pairs are (foreground . background). Cycles through,
+preferring pairs not already in use."
   (let* ((used (mapcar (lambda (p)
                          (cons (plist-get p :foreground)
                                (plist-get p :background)))
