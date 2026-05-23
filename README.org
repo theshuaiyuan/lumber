@@ -1,0 +1,166 @@
+#+title: Lumber — Log Analysis Pattern Manager for Emacs
+#+author: shuaiy
+#+language: en
+
+Lumber manages a set of color-coded search patterns for log file analysis.
+It sends patterns to multiple search backends (occur, vlf-occur, grep, ripgrep)
+and applies per-pattern colored highlighting in the results buffer.
+
+* Features
+
+- *Color-coded patterns* — each pattern gets its own foreground/background color,
+  automatically assigned from a configurable palette
+- *Multiple search backends* — occur, vlf-occur (for large files via [[https://github.com/m00natic/vlfi][vlf]]),
+  grep, and ripgrep; auto-selects the best backend for the current buffer
+- *Mixed case-sensitivity* — per-pattern control (~yes~ / ~no~ / ~auto~) handled
+  via character-class expansion so a single regexp pass covers all patterns
+- *Tabulated management buffer* — view, toggle, edit, and delete patterns in a
+  ~tabulated-list-mode~ buffer
+- *Transient command panel* — all commands accessible from a single ~?~ menu
+- *Named pattern sets* — save and reload groups of patterns across sessions,
+  persisted to ~lumber-sets.eld~
+
+* Requirements
+
+| Dependency | Required | Notes                                       |
+|------------+----------+---------------------------------------------|
+| Emacs      | 29.1+    | for built-in transient and ~tabulated-list~ |
+| transient  | required | built-in since Emacs 29                     |
+| vlf        | optional | enables ~vlf-occur~ backend for large files |
+| ripgrep    | optional | enables ripgrep backend; falls back to grep |
+
+* Installation
+
+** Manual (recommended for development)
+
+Clone the repository and add to your configuration:
+
+#+begin_src emacs-lisp
+(use-package lumber
+  :ensure nil
+  :demand t
+  :load-path "~/.emacs.d/site-lisp/lumber"
+  :bind-keymap ("C-c l" . lumber-command-map))
+#+end_src
+
+** use-package with vc
+
+Requires Emacs 29.1+ (built-in ~package-vc~):
+
+#+begin_src emacs-lisp
+(use-package lumber
+  :vc (:url "https://github.com/shuaiy/lumber" :rev :newest)
+  :demand t
+  :bind-keymap ("C-c l" . lumber-command-map))
+#+end_src
+
+* Quick Start
+
+#+begin_src
+;; 1. Open a log file (works with regular files and vlf large-file buffers)
+;;    C-x C-f /path/to/app.log
+
+;; 2. Add patterns (quick-add: literal, auto case, next color)
+;;    C-c l A  →  "ERROR"      RET    (red highlight)
+;;    C-c l A  →  "WARN"       RET    (orange highlight)
+;;    C-c l A  →  "timeout"    RET    (blue highlight)
+
+;; 3. Search (auto-selects backend)
+;;    C-c l s
+
+;; 4. Manage patterns
+;;    C-c l l                         open *Lumber Patterns* buffer
+
+;; 5. Save for next session
+;;    C-c l w  →  "my-service"  RET   save named set
+;;    C-c l W                         write to disk
+#+end_src
+
+* Key Bindings
+
+Bind ~lumber-command-map~ to a prefix key of your choice (e.g. ~C-c l~).
+
+| Key     | Command                       | Description                        |
+|---------+-------------------------------+------------------------------------|
+| ~a~     | ~lumber-add~                  | Add pattern (full prompts)         |
+| ~A~     | ~lumber-quick-add~            | Add pattern (defaults)             |
+| ~d~     | ~lumber-remove~               | Remove a pattern                   |
+| ~t~     | ~lumber-toggle~               | Toggle pattern enabled/disabled    |
+| ~e~     | ~lumber-edit~                 | Edit pattern attributes            |
+| ~l~     | ~lumber-list~                 | Open pattern management buffer     |
+| ~c~     | ~lumber-clear~                | Remove all patterns                |
+| ~s~     | ~lumber-search~               | Search (auto backend)              |
+| ~h~     | ~lumber-apply-highlights~     | Reapply highlights in buffer       |
+| ~H~     | ~lumber-clear-highlights~     | Clear highlights from buffer       |
+| ~w~     | ~lumber-save-set~             | Save patterns as named set         |
+| ~r~     | ~lumber-load-set~             | Load a named set                   |
+| ~W~     | ~lumber-persist-save~         | Write all sets to disk             |
+| ~z~     | ~lumber-toggle-result-window~ | Toggle result window height        |
+| ~?~     | ~lumber-transient~            | Show transient command panel       |
+
+Inside ~*Lumber Patterns*~ buffer, additional bindings are available:
+~RET~ / ~e~ edit at point, ~t~ toggle at point, ~d~ delete at point, ~g~ refresh.
+
+* Configuration
+
+#+begin_src emacs-lisp
+(use-package lumber
+  :ensure nil
+  :demand t
+  :load-path "~/.emacs.d/site-lisp/lumber"
+  :bind-keymap ("C-c l" . lumber-command-map)
+  :custom
+  ;; Backend: auto | occur | vlf-occur | grep | ripgrep
+  (lumber-search-backend 'auto)
+  ;; Result window height as fraction of frame (default / expanded)
+  (lumber-result-window-height 0.3)
+  (lumber-result-window-height-max 0.9)
+  ;; Context lines for grep/ripgrep
+  (lumber-context-lines 0)
+  ;; Default color palette (foreground . background)
+  (lumber-default-colors
+   '(("white" . "red")
+     ("black" . "orange")
+     ("white" . "blue")
+     ("black" . "green3")
+     ("white" . "purple")
+     ("black" . "cyan")
+     ("white" . "dark green")
+     ("black" . "yellow"))))
+#+end_src
+
+* Search Backends
+
+| Backend     | Trigger condition (auto mode)          | Notes                  |
+|-------------+----------------------------------------+------------------------|
+| ~vlf-occur~ | current buffer is in ~vlf-mode~        | requires vlf package   |
+| ~ripgrep~   | ~rg~ in PATH and buffer has a filename | single combined regexp |
+| ~occur~     | fallback                               | always available       |
+| ~grep~      | explicit only                          | ~lumber-search-grep~   |
+
+** Case sensitivity strategy
+
+Lumber runs all searches with ~case-fold-search~ set to ~nil~, then achieves
+per-pattern case control by expanding lowercase letters to ~[Aa]~ character
+classes for case-insensitive patterns.  This means a single combined regexp
+covers all patterns in one pass regardless of their individual case settings.
+
+Limitation: ~:type regexp~ patterns with ~:case-sensitive nil~ are not expanded
+(expansion would break regexp syntax).  For regexp patterns, uppercase presence
+determines sensitivity under ~auto~ mode.
+
+* Persistence
+
+Named pattern sets are stored in memory via ~lumber-save-set~ and flushed to
+disk via ~lumber-persist-save~.  The file is loaded automatically at startup.
+
+Default location: =~/.emacs.d/lumber-sets.eld=
+
+Override with:
+#+begin_src emacs-lisp
+(setq lumber-persist-file (locate-user-emacs-file "my-lumber-sets.eld"))
+#+end_src
+
+* License
+
+GPLv3 or later.

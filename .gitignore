@@ -1,0 +1,7 @@
+# Byte-compiled files
+*.elc
+
+# Emacs backup and auto-save files
+*~
+\#*\#
+.\#*
