@@ -1,7 +1,7 @@
 ;;; lumber.el --- Log analysis pattern manager -*- lexical-binding: t -*-
 
 ;; Author: shuaiy
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "29.1") (transient "0.6"))
 ;; Keywords: tools, matching, logs
 ;; URL: https://github.com/theshuaiyuan/lumber
@@ -74,10 +74,12 @@
 ;;;; Internal State
 
 (defvar lumber--patterns nil
-  "List of pattern plists. This is the active working set.")
+  "List of pattern plists.  This is the global active working set.
+Highlight state is applied per-buffer on demand via `lumber--apply-highlights';
+not every open buffer is automatically kept in sync.")
 
-(defvar lumber--saved-sets nil
-  "Alist of (NAME . PATTERN-LIST) for named pattern sets.")
+(defvar lumber--current-set-name nil
+  "Name of the currently loaded pattern set, or nil if none.")
 
 (defvar lumber--history nil
   "Minibuffer input history for pattern strings.")
@@ -88,8 +90,13 @@
 (defvar lumber--face-counter 0
   "Counter for auto-incrementing lumber face names.")
 
-(defvar lumber--grep-buffer-name nil
-  "Buffer name of the most recent lumber grep/rg result.")
+(defvar-local lumber--applied-regexps nil
+  "Regexps currently highlighted by lumber in this buffer.
+Used by `lumber--clear-highlights' to remove exactly what was applied.")
+
+(defvar-local lumber--header-line-remap-cookie nil
+  "Cookie from `face-remap-add-relative' for the header-line remap.
+Saved so it can be removed when the major mode changes.")
 
 ;;;; Face Generation
 
@@ -166,8 +173,8 @@ Uses \\| (Emacs regexp syntax) as alternation."
       (mapconcat #'lumber--pattern-to-regexp enabled "\\|"))))
 
 (defun lumber--build-grep-regexp ()
-  "Build a combined regexp for external tools.
-Uses | (POSIX ERE / PCRE) as alternation."
+  "Build a combined regexp for external tools (grep -E / ripgrep).
+Uses | as alternation."
   (let ((enabled (cl-remove-if-not
                   (lambda (p) (plist-get p :enabled))
                   lumber--patterns)))
@@ -177,8 +184,13 @@ Uses | (POSIX ERE / PCRE) as alternation."
 ;;;; Highlight Application
 
 (defun lumber--apply-highlights (&optional buffer)
-  "Apply per-pattern highlights in BUFFER (default: current buffer)."
+  "Apply per-pattern highlights in BUFFER (default: current buffer).
+Reads from the global `lumber--patterns'; applied state is tracked
+per-buffer in `lumber--applied-regexps'.  Clears any existing lumber
+highlights in BUFFER before re-applying so stale hi-lock state cannot
+accumulate on repeated calls."
   (with-current-buffer (or buffer (current-buffer))
+    (lumber--clear-highlights)
     (hi-lock-mode 1)
     (dolist (pat lumber--patterns)
       (when (plist-get pat :enabled)
@@ -186,15 +198,19 @@ Uses | (POSIX ERE / PCRE) as alternation."
                (fg     (plist-get pat :foreground))
                (bg     (plist-get pat :background))
                (face   (lumber--get-face fg bg)))
-          (highlight-regexp regexp face))))))
+          (highlight-regexp regexp face)
+          (push regexp lumber--applied-regexps))))))
 
 (defun lumber--clear-highlights (&optional buffer)
-  "Remove all lumber-managed highlights in BUFFER (default: current buffer)."
+  "Remove all lumber-managed highlights in BUFFER (default: current buffer).
+Reads from the buffer-local `lumber--applied-regexps' registry rather than
+recomputing from the current pattern set, so patterns that have already been
+edited or removed are still cleaned up correctly."
   (with-current-buffer (or buffer (current-buffer))
-    (dolist (pat lumber--patterns)
-      (let ((regexp (lumber--pattern-to-regexp pat)))
-        (ignore-errors
-          (unhighlight-regexp regexp))))))
+    (dolist (regexp lumber--applied-regexps)
+      (ignore-errors
+        (unhighlight-regexp regexp)))
+    (setq lumber--applied-regexps nil)))
 
 ;;;; Color Assignment
 
@@ -234,6 +250,23 @@ Returns the selected pattern plist or nil."
            (sel (completing-read prompt (mapcar #'car choices) nil t)))
       (cdr (assoc sel choices)))))
 
+;;;; List Buffer Helper
+
+(defun lumber--after-patterns-changed ()
+  "Reapply lumber highlights in the current buffer and refresh *Lumber Patterns*.
+Only the current buffer's highlights are updated; other open buffers where
+lumber highlights may already have been applied are not affected."
+  (lumber--apply-highlights)
+  (lumber--refresh-list-buffer))
+
+(defun lumber--refresh-list-buffer ()
+  "Refresh the *Lumber Patterns* buffer if it exists and is in `lumber-list-mode'."
+  (when-let ((buf (get-buffer "*Lumber Patterns*")))
+    (with-current-buffer buf
+      (when (derived-mode-p 'lumber-list-mode)
+        (tabulated-list-revert)
+        (lumber--add-color-overlays)))))
+
 ;;;; CRUD: Add
 
 ;;;###autoload
@@ -260,8 +293,8 @@ Returns the selected pattern plist or nil."
                       :foreground fg
                       :background bg
                       :enabled t)))
-    (setq lumber--patterns (append lumber--patterns (list plist)))
-    (lumber--apply-highlights)
+    (setq lumber--patterns (nconc lumber--patterns (list plist)))
+    (lumber--after-patterns-changed)
     (message "Added: %s (%s, %s-case, ■ %s/%s) [%d patterns]"
              pat type case-s bg fg (length lumber--patterns))))
 
@@ -279,8 +312,8 @@ Returns the selected pattern plist or nil."
                       :foreground fg
                       :background bg
                       :enabled t)))
-    (setq lumber--patterns (append lumber--patterns (list plist)))
-    (lumber--apply-highlights)
+    (setq lumber--patterns (nconc lumber--patterns (list plist)))
+    (lumber--after-patterns-changed)
     (message "Added: %s (literal, auto-case, ■ %s/%s) [%d patterns]"
              pat bg fg (length lumber--patterns))))
 
@@ -293,9 +326,9 @@ Returns the selected pattern plist or nil."
   (let ((buf (get-buffer-create "*Lumber Patterns*")))
     (with-current-buffer buf
       (unless (derived-mode-p 'lumber-list-mode)
-        (lumber-list-mode))
-      (tabulated-list-revert))
-    (pop-to-buffer buf)))
+        (lumber-list-mode)))
+    (pop-to-buffer buf))
+  (lumber--refresh-list-buffer))
 
 ;;;###autoload
 (defun lumber-list-brief ()
@@ -350,13 +383,12 @@ Returns the selected pattern plist or nil."
                                  nil nil old-fg))
          (new-bg    (read-string (format "Background [%s]: " old-bg)
                                  nil nil old-bg)))
-    (lumber--clear-highlights)
     (plist-put pat :pattern new-pat)
     (plist-put pat :type new-type)
     (plist-put pat :case-sensitive new-case)
     (plist-put pat :foreground new-fg)
     (plist-put pat :background new-bg)
-    (lumber--apply-highlights)
+    (lumber--after-patterns-changed)
     (message "Updated pattern: %s" new-pat)))
 
 ;;;###autoload
@@ -369,8 +401,7 @@ Returns the selected pattern plist or nil."
     (let* ((current (plist-get pat :enabled))
            (new-val (not current)))
       (plist-put pat :enabled new-val)
-      (lumber--clear-highlights)
-      (lumber--apply-highlights)
+      (lumber--after-patterns-changed)
       (message "Toggled: %s → %s"
                (plist-get pat :pattern)
                (if new-val "enabled" "disabled")))))
@@ -384,19 +415,20 @@ Returns the selected pattern plist or nil."
   (let ((pat (lumber--select-pattern "Remove pattern: ")))
     (unless pat
       (user-error "No patterns to remove"))
-    (lumber--clear-highlights)
     (setq lumber--patterns (delq pat lumber--patterns))
-    (lumber--apply-highlights)
+    (lumber--after-patterns-changed)
     (message "Removed: %s [%d remaining]"
              (plist-get pat :pattern)
              (length lumber--patterns))))
 
 ;;;###autoload
 (defun lumber-clear ()
-  "Remove all patterns and all highlights."
+  "Clear the active pattern set and remove lumber-managed highlights in the current buffer.
+Does not retroactively clear highlights in other open buffers where they may
+already have been applied."
   (interactive)
-  (lumber--clear-highlights)
   (setq lumber--patterns nil)
+  (lumber--after-patterns-changed)
   (message "Cleared all patterns."))
 
 ;;;; Search Backends
@@ -458,8 +490,8 @@ BACKEND overrides `lumber-search-backend'."
 ;;;###autoload
 (defun lumber-search-grep ()
   "Search using external grep backend.
-Note: :type regexp patterns must use POSIX ERE syntax (not Emacs regexp
-syntax). :type literal patterns are always safe."
+Note: :type regexp patterns are passed as-is to grep -E; Emacs regexp syntax
+differs from POSIX ERE, so complex regexp patterns may need adjustment."
   (interactive)
   (unless lumber--patterns
     (user-error "No patterns defined"))
@@ -474,7 +506,6 @@ syntax). :type literal patterns are always safe."
                          (if (> ctx 0) (format "-C %d" ctx) "")
                          (shell-quote-argument regexp)
                          (shell-quote-argument (expand-file-name file)))))
-      (setq lumber--grep-buffer-name "*grep*")
       (grep cmd))))
 
 ;;;###autoload
@@ -482,8 +513,9 @@ syntax). :type literal patterns are always safe."
   "Search using ripgrep backend.
 Uses the same [Aa]-expansion strategy as other backends for consistent
 case-sensitivity handling, passing a single combined regexp to rg.
-Note: :type regexp patterns must use PCRE syntax (not Emacs regexp
-syntax). :type literal patterns are always safe."
+Note: :type regexp patterns are passed as-is to rg; some Emacs regexp
+constructs are not supported by ripgrep's regexp engine and may need
+adjustment."
   (interactive)
   (unless lumber--patterns
     (user-error "No patterns defined"))
@@ -504,7 +536,6 @@ syntax). :type literal patterns are always safe."
                         ctx-flag
                         (shell-quote-argument regexp)
                         (shell-quote-argument (expand-file-name file)))))
-      (setq lumber--grep-buffer-name buf-name)
       (compilation-start cmd 'grep-mode (lambda (_) buf-name)))))
 
 ;;;; Apply/Clear Highlights (interactive)
@@ -545,8 +576,12 @@ syntax). :type literal patterns are always safe."
                   (case-s-str (cond ((eq case-s t)    "yes")
                                    ((eq case-s nil)   "no")
                                    (t                 "auto")))
-                  (colors  (propertize (format "■ %s/%s" fg bg) 'face face)))
-             (list i (vector status type-s case-s-str pattern colors)))))
+                  (colors  (propertize (format "■ %s/%s" fg bg)
+                                       'face face
+                                       'font-lock-face face
+                                       'rear-nonsticky t
+                                       'lumber-colors-cell t)))
+             (list i (vector pattern status type-s case-s-str colors)))))
 
 (defun lumber--list-get-pattern ()
   "Return the pattern plist for the entry at point in `lumber-list-mode'."
@@ -561,10 +596,8 @@ syntax). :type literal patterns are always safe."
   (let ((pat (lumber--list-get-pattern)))
     (unless pat
       (user-error "No pattern at point"))
-    (lumber--clear-highlights)
     (setq lumber--patterns (delq pat lumber--patterns))
-    (lumber--apply-highlights)
-    (tabulated-list-revert)
+    (lumber--after-patterns-changed)
     (message "Removed: %s [%d remaining]"
              (plist-get pat :pattern) (length lumber--patterns))))
 
@@ -576,9 +609,7 @@ syntax). :type literal patterns are always safe."
     (unless pat
       (user-error "No pattern at point"))
     (plist-put pat :enabled (not (plist-get pat :enabled)))
-    (lumber--clear-highlights)
-    (lumber--apply-highlights)
-    (tabulated-list-revert)
+    (lumber--after-patterns-changed)
     (message "Toggled: %s → %s"
              (plist-get pat :pattern)
              (if (plist-get pat :enabled) "enabled" "disabled"))))
@@ -590,8 +621,105 @@ syntax). :type literal patterns are always safe."
   (let ((pat (lumber--list-get-pattern)))
     (unless pat
       (user-error "No pattern at point"))
-    (lumber--edit-pattern pat)
-    (tabulated-list-revert)))
+    (lumber--edit-pattern pat)))
+
+;;;###autoload
+(defun lumber-cycle-fg-at-point ()
+  "Cycle foreground color for the pattern at point."
+  (interactive)
+  (let ((pat (lumber--list-get-pattern)))
+    (unless pat (user-error "No pattern at point"))
+    (let* ((all-fgs (cl-remove-duplicates
+                     (mapcar #'car lumber-default-colors)
+                     :test #'equal))
+           (current-fg (plist-get pat :foreground))
+           (pos (or (cl-position current-fg all-fgs :test #'equal) 0))
+           (next-fg (nth (mod (1+ pos) (length all-fgs)) all-fgs)))
+      (plist-put pat :foreground next-fg)
+      (lumber--after-patterns-changed))))
+
+;;;###autoload
+(defun lumber-cycle-bg-at-point ()
+  "Cycle background color for the pattern at point."
+  (interactive)
+  (let ((pat (lumber--list-get-pattern)))
+    (unless pat (user-error "No pattern at point"))
+    (let* ((all-bgs (cl-remove-duplicates
+                     (mapcar #'cdr lumber-default-colors)
+                     :test #'equal))
+           (current-bg (plist-get pat :background))
+           (pos (or (cl-position current-bg all-bgs :test #'equal) 0))
+           (next-bg (nth (mod (1+ pos) (length all-bgs)) all-bgs)))
+      (plist-put pat :background next-bg)
+      (lumber--after-patterns-changed))))
+
+;;;###autoload
+(defun lumber-cycle-case-at-point ()
+  "Cycle case-sensitive setting for the pattern at point: auto → yes → no → auto."
+  (interactive)
+  (let ((pat (lumber--list-get-pattern)))
+    (unless pat (user-error "No pattern at point"))
+    (let* ((current (plist-get pat :case-sensitive))
+           (next (cond ((eq current 'auto) t)
+                       ((eq current t) nil)
+                       (t 'auto))))
+      (plist-put pat :case-sensitive next)
+      (lumber--after-patterns-changed)
+      (message "Case: %s" (cond ((eq next t) "yes")
+                                ((eq next nil) "no")
+                                (t "auto"))))))
+
+;;;###autoload
+(defun lumber-cycle-type-at-point ()
+  "Toggle type between literal and regexp for the pattern at point."
+  (interactive)
+  (let ((pat (lumber--list-get-pattern)))
+    (unless pat (user-error "No pattern at point"))
+    (let ((new-type (if (eq (plist-get pat :type) 'literal) 'regexp 'literal)))
+      (plist-put pat :type new-type)
+      (lumber--after-patterns-changed)
+      (message "Type: %s" new-type))))
+
+;;;###autoload
+(defun lumber-edit-pattern-at-point ()
+  "Edit only the pattern string for the pattern at point."
+  (interactive)
+  (let ((pat (lumber--list-get-pattern)))
+    (unless pat (user-error "No pattern at point"))
+    (let* ((old-pattern (plist-get pat :pattern))
+           (new-pattern (read-string "Pattern: " old-pattern 'lumber--history)))
+      (unless (string-equal old-pattern new-pattern)
+        (plist-put pat :pattern new-pattern)
+        (lumber--after-patterns-changed)
+        (message "Updated pattern: %s" new-pattern)))))
+
+(defun lumber--add-color-overlays (&optional buffer)
+  "Add high-priority overlays on each Colors cell in BUFFER (default: current buffer).
+Locates each cell via the \\='lumber-colors-cell text property set during entry
+generation, so overlay placement is independent of column widths or offsets."
+  (with-current-buffer (or buffer (current-buffer))
+    (remove-overlays (point-min) (point-max) 'lumber-color-ov t)
+        (save-excursion
+          (goto-char (point-min))
+          (while (not (eobp))
+            (let* ((id  (tabulated-list-get-id))
+                   (pat (when (and (numberp id) (< id (length lumber--patterns)))
+                          (nth id lumber--patterns))))
+              (when pat
+                (let* ((lb  (line-beginning-position))
+                       (le  (line-end-position))
+                       (beg (text-property-any lb le 'lumber-colors-cell t))
+                       (end (when beg
+                              (next-single-property-change
+                               beg 'lumber-colors-cell nil le))))
+                  (when (and beg end)
+                    (let ((ov (make-overlay beg end)))
+                      (overlay-put ov 'face
+                                   (lumber--get-face (plist-get pat :foreground)
+                                                     (plist-get pat :background)))
+                      (overlay-put ov 'priority 1000)
+                      (overlay-put ov 'lumber-color-ov t))))))
+            (forward-line 1)))))
 
 (defvar lumber-list-mode-map
   (let ((map (make-sparse-keymap)))
@@ -603,25 +731,45 @@ syntax). :type literal patterns are always safe."
     (define-key map (kbd "c")   #'lumber-clear)
     (define-key map (kbd "s")   #'lumber-search)
     (define-key map (kbd "g")   #'revert-buffer)
-    (define-key map (kbd "w")   #'lumber-save-set)
-    (define-key map (kbd "r")   #'lumber-load-set)
-    (define-key map (kbd "W")   #'lumber-persist-save)
+    (define-key map (kbd "w")   #'lumber-save)
+    (define-key map (kbd "r")   #'lumber-load)
     (define-key map (kbd "q")   #'quit-window)
     (define-key map (kbd "?")   #'lumber-transient)
+    (define-key map (kbd "SPC") #'lumber-toggle-at-point)
+    (define-key map (kbd "f")   #'lumber-cycle-fg-at-point)
+    (define-key map (kbd "b")   #'lumber-cycle-bg-at-point)
+    (define-key map (kbd "C")   #'lumber-cycle-case-at-point)
+    (define-key map (kbd "T")   #'lumber-cycle-type-at-point)
+    (define-key map (kbd "p")   #'lumber-edit-pattern-at-point)
     map)
   "Keymap for `lumber-list-mode'.")
 
 (define-derived-mode lumber-list-mode tabulated-list-mode "Lumber"
   "Major mode for managing lumber patterns."
   (setq tabulated-list-format
-        [("S"       3  t)
-         ("Type"    8  t)
-         ("Case"    5  t)
-         ("Pattern" 40 t)
+        [("Pattern" 40 t)
+         ("S"        3 t)
+         ("Type"     8 t)
+         ("Case"     5 t)
          ("Colors"  20 nil)])
   (setq tabulated-list-entries #'lumber--list-entries)
   (setq tabulated-list-padding 1)
-  (tabulated-list-init-header))
+  (tabulated-list-init-header)
+  (when lumber--header-line-remap-cookie
+    (face-remap-remove-relative lumber--header-line-remap-cookie)
+    (setq lumber--header-line-remap-cookie nil))
+  (setq lumber--header-line-remap-cookie
+        (face-remap-add-relative 'header-line :weight 'bold))
+  (add-hook 'change-major-mode-hook
+            (lambda ()
+              (when lumber--header-line-remap-cookie
+                (face-remap-remove-relative lumber--header-line-remap-cookie)
+                (setq lumber--header-line-remap-cookie nil)))
+            nil t)
+  (add-hook 'after-revert-hook #'lumber--add-color-overlays nil t)
+  (setq mode-name
+        '(:eval (format "Lumber[%s]"
+                        (or lumber--current-set-name "?")))))
 
 ;;;; Transient Panel
 
@@ -640,14 +788,20 @@ syntax). :type literal patterns are always safe."
    ("o" "Search (occur)"     lumber-search-occur)
    ("v" "Search (vlf-occur)" lumber-search-vlf-occur)
    ("G" "Search (grep)"      lumber-search-grep)
-   ("r" "Search (ripgrep)"   lumber-search-ripgrep)]
+   ("R" "Search (ripgrep)"   lumber-search-ripgrep)]
   ["Highlight"
    ("h" "Apply highlights"   lumber-apply-highlights)
    ("H" "Clear highlights"   lumber-clear-highlights)]
   ["Pattern Sets"
-   ("w" "Save set"           lumber-save-set)
-   ("R" "Load set"           lumber-load-set)
-   ("W" "Persist to disk"    lumber-persist-save)]
+   ("w" "Save to disk"       lumber-save)
+   ("r" "Load from disk"     lumber-load)]
+  ["List Buffer Keys (in *Lumber Patterns*)"
+   ("SPC" "Toggle at point"     lumber-toggle-at-point)
+   ("f"   "Cycle foreground"    lumber-cycle-fg-at-point)
+   ("b"   "Cycle background"    lumber-cycle-bg-at-point)
+   ("C"   "Cycle case"          lumber-cycle-case-at-point)
+   ("T"   "Cycle type"          lumber-cycle-type-at-point)
+   ("p"   "Edit pattern string" lumber-edit-pattern-at-point)]
   ["Window"
    ("z" "Toggle result height" lumber-toggle-result-window)])
 
@@ -666,9 +820,8 @@ syntax). :type literal patterns are always safe."
     (define-key map (kbd "s") #'lumber-search)
     (define-key map (kbd "h") #'lumber-apply-highlights)
     (define-key map (kbd "H") #'lumber-clear-highlights)
-    (define-key map (kbd "w") #'lumber-save-set)
-    (define-key map (kbd "r") #'lumber-load-set)
-    (define-key map (kbd "W") #'lumber-persist-save)
+    (define-key map (kbd "w") #'lumber-save)
+    (define-key map (kbd "r") #'lumber-load)
     (define-key map (kbd "z") #'lumber-toggle-result-window)
     (define-key map (kbd "?") #'lumber-transient)
     map)
@@ -720,54 +873,58 @@ syntax). :type literal patterns are always safe."
 ;;;; Persistence
 
 ;;;###autoload
-(defun lumber-save-set (name)
-  "Save current patterns as named set NAME."
-  (interactive "sSave set as: ")
-  (when (string-empty-p name)
-    (user-error "Set name cannot be empty"))
-  (let ((existing (assoc name lumber--saved-sets)))
-    (if existing
-        (setcdr existing (copy-tree lumber--patterns))
-      (push (cons name (copy-tree lumber--patterns)) lumber--saved-sets)))
-  (message "Saved pattern set: %s" name))
+(defun lumber-save ()
+  "Save current patterns to disk under the current set name.
+Prompts for a name if `lumber--current-set-name' is nil."
+  (interactive)
+  (unless lumber--current-set-name
+    (let ((name (read-string "Save as: ")))
+      (when (string-empty-p name)
+        (user-error "Set name cannot be empty"))
+      (setq lumber--current-set-name name)))
+  (let* ((existing (when (file-readable-p lumber-persist-file)
+                     (with-temp-buffer
+                       (insert-file-contents lumber-persist-file)
+                       (goto-char (point-min))
+                       (condition-case err
+                           (read (current-buffer))
+                         (error
+                          (user-error "Persist file is corrupt, aborting save: %s"
+                                      err))))))
+         (alist (or existing nil))
+         (entry (assoc lumber--current-set-name alist)))
+    (if entry
+        (setcdr entry (copy-tree lumber--patterns))
+      (setq alist (append alist (list (cons lumber--current-set-name
+                                            (copy-tree lumber--patterns))))))
+    (with-temp-file lumber-persist-file
+      (let ((print-level nil)
+            (print-length nil))
+        (prin1 alist (current-buffer))
+        (insert "\n"))))
+  (message "Saved set '%s' to %s" lumber--current-set-name lumber-persist-file))
 
 ;;;###autoload
-(defun lumber-load-set ()
-  "Load a named pattern set, replacing current patterns."
+(defun lumber-load ()
+  "Load a pattern set from `lumber-persist-file'."
   (interactive)
-  (unless lumber--saved-sets
-    (user-error "No saved pattern sets. Use lumber-save-set first"))
-  (let* ((names (mapcar #'car lumber--saved-sets))
-         (sel   (completing-read "Load set: " names nil t))
-         (set   (cdr (assoc sel lumber--saved-sets))))
-    (lumber--clear-highlights)
-    (setq lumber--patterns (copy-tree set))
-    (lumber--apply-highlights)
-    (message "Loaded pattern set: %s (%d patterns)" sel (length lumber--patterns))))
-
-;;;###autoload
-(defun lumber-persist-save ()
-  "Write `lumber--saved-sets' to `lumber-persist-file'."
-  (interactive)
-  (with-temp-file lumber-persist-file
-    (let ((print-level nil)
-          (print-length nil))
-      (prin1 lumber--saved-sets (current-buffer))
-      (insert "\n")))
-  (message "Saved sets to %s" lumber-persist-file))
-
-;;;###autoload
-(defun lumber-persist-load ()
-  "Load `lumber--saved-sets' from `lumber-persist-file'."
-  (interactive)
-  (when (file-readable-p lumber-persist-file)
-    (with-temp-buffer
-      (insert-file-contents lumber-persist-file)
-      (goto-char (point-min))
-      (condition-case err
-          (setq lumber--saved-sets (read (current-buffer)))
-        (error
-         (message "lumber: failed to load persist file: %s" err))))))
+  (unless (file-readable-p lumber-persist-file)
+    (user-error "No persist file found: %s" lumber-persist-file))
+  (let* ((alist (with-temp-buffer
+                  (insert-file-contents lumber-persist-file)
+                  (goto-char (point-min))
+                  (condition-case err
+                      (read (current-buffer))
+                    (error
+                     (user-error "Failed to read persist file: %s" err)))))
+         (name (if (= (length alist) 1)
+                   (caar alist)
+                 (completing-read "Load set: " (mapcar #'car alist) nil t)))
+         (patterns (cdr (assoc name alist))))
+    (setq lumber--current-set-name name)
+    (setq lumber--patterns (copy-tree patterns))
+    (lumber--after-patterns-changed)
+    (message "Loaded set '%s' (%d patterns)" name (length lumber--patterns))))
 
 ;;;; Integration Points
 
@@ -814,9 +971,6 @@ syntax). :type literal patterns are always safe."
                                            (when (string-match-p "\\*VLF-occur"
                                                                   (buffer-name buf))
                                              (lumber--apply-highlights buf)))))))))
-
-;; Auto-load saved sets at startup
-(add-hook 'after-init-hook #'lumber-persist-load)
 
 (provide 'lumber)
 ;;; lumber.el ends here

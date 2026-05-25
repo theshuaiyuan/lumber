@@ -14,8 +14,8 @@ and applies per-pattern colored highlighting in the results buffer.
   grep, and ripgrep; auto-selects the best backend for the current buffer
 - *Mixed case-sensitivity* — per-pattern control (~yes~ / ~no~ / ~auto~) handled
   via character-class expansion so a single regexp pass covers all patterns
-- *Tabulated management buffer* — view, toggle, edit, and delete patterns in a
-  ~tabulated-list-mode~ buffer
+- *Tabulated management buffer* — view, toggle, and inline-edit patterns in a
+  dedicated ~*Lumber Patterns*~ buffer
 - *Transient command panel* — all commands accessible from a single ~?~ menu
 - *Named pattern sets* — save and reload groups of patterns across sessions,
   persisted to ~lumber-sets.eld~
@@ -71,35 +71,51 @@ Requires Emacs 29.1+ (built-in ~package-vc~):
 ;; 4. Manage patterns
 ;;    C-c l l                         open *Lumber Patterns* buffer
 
-;; 5. Save for next session
-;;    C-c l w  →  "my-service"  RET   save named set
-;;    C-c l W                         write to disk
+;; 5. Save / load across sessions
+;;    C-c l w  →  "my-service"  RET   save named set to disk (prompts for name on first save)
+;;    C-c l r                         load a named set from disk
 #+end_src
 
 * Key Bindings
 
 Bind ~lumber-command-map~ to a prefix key of your choice (e.g. ~C-c l~).
 
-| Key     | Command                       | Description                        |
-|---------+-------------------------------+------------------------------------|
-| ~a~     | ~lumber-add~                  | Add pattern (full prompts)         |
-| ~A~     | ~lumber-quick-add~            | Add pattern (defaults)             |
-| ~d~     | ~lumber-remove~               | Remove a pattern                   |
-| ~t~     | ~lumber-toggle~               | Toggle pattern enabled/disabled    |
-| ~e~     | ~lumber-edit~                 | Edit pattern attributes            |
-| ~l~     | ~lumber-list~                 | Open pattern management buffer     |
-| ~c~     | ~lumber-clear~                | Remove all patterns                |
-| ~s~     | ~lumber-search~               | Search (auto backend)              |
-| ~h~     | ~lumber-apply-highlights~     | Reapply highlights in buffer       |
-| ~H~     | ~lumber-clear-highlights~     | Clear highlights from buffer       |
-| ~w~     | ~lumber-save-set~             | Save patterns as named set         |
-| ~r~     | ~lumber-load-set~             | Load a named set                   |
-| ~W~     | ~lumber-persist-save~         | Write all sets to disk             |
-| ~z~     | ~lumber-toggle-result-window~ | Toggle result window height        |
-| ~?~     | ~lumber-transient~            | Show transient command panel       |
+| Key | Command                       | Description                             |
+|-----+-------------------------------+-----------------------------------------|
+| ~a~ | ~lumber-add~                  | Add pattern (full prompts)              |
+| ~A~ | ~lumber-quick-add~            | Add pattern (defaults)                  |
+| ~d~ | ~lumber-remove~               | Remove a pattern                        |
+| ~t~ | ~lumber-toggle~               | Toggle pattern enabled/disabled         |
+| ~e~ | ~lumber-edit~                 | Edit pattern attributes                 |
+| ~l~ | ~lumber-list~                 | Open pattern management buffer          |
+| ~c~ | ~lumber-clear~                | Clear the active pattern set            |
+| ~s~ | ~lumber-search~               | Search (auto backend)                   |
+| ~h~ | ~lumber-apply-highlights~     | Reapply highlights in current buffer    |
+| ~H~ | ~lumber-clear-highlights~     | Clear highlights from current buffer    |
+| ~w~ | ~lumber-save~                 | Save active set to disk                 |
+| ~r~ | ~lumber-load~                 | Load a named set from disk              |
+| ~z~ | ~lumber-toggle-result-window~ | Toggle result window height             |
+| ~?~ | ~lumber-transient~            | Show transient command panel            |
 
-Inside ~*Lumber Patterns*~ buffer, additional bindings are available:
-~RET~ / ~e~ edit at point, ~t~ toggle at point, ~d~ delete at point, ~g~ refresh.
+** Inside ~*Lumber Patterns*~ buffer
+
+The management buffer has additional inline-editing bindings:
+
+| Key   | Description                                      |
+|-------+--------------------------------------------------|
+| ~RET~ / ~e~ | Edit all attributes of pattern at point    |
+| ~p~   | Edit pattern string only                         |
+| ~t~ / ~SPC~ | Toggle enabled/disabled                    |
+| ~f~   | Cycle foreground color                           |
+| ~b~   | Cycle background color                           |
+| ~C~   | Cycle case sensitivity (auto → yes → no → auto)  |
+| ~T~   | Cycle type (literal ↔ regexp)                    |
+| ~d~   | Delete pattern at point                          |
+| ~w~   | Save active set to disk                          |
+| ~r~   | Load a named set from disk                       |
+| ~g~   | Refresh buffer                                   |
+| ~?~   | Show transient command panel (full key reference)|
+| ~q~   | Quit window                                      |
 
 * Configuration
 
@@ -138,6 +154,24 @@ Inside ~*Lumber Patterns*~ buffer, additional bindings are available:
 | ~occur~     | fallback                               | always available       |
 | ~grep~      | explicit only                          | ~lumber-search-grep~   |
 
+** Pattern types and backend compatibility
+
+Lumber supports two pattern types, selected per-pattern.
+
+- ~:type literal~ (default) — the pattern string is treated as a literal substring.
+  Lumber escapes it for regexp engines automatically, so it works identically across
+  all backends.  *Use literal patterns whenever possible; they are the safest and
+  most portable choice for log analysis.*
+
+- ~:type regexp~ — the pattern string is passed as-is to the search backend.
+  Behavior varies by backend:
+  - ~occur~ / ~vlf-occur~: expects Emacs regexp syntax
+  - ~grep~: expects POSIX ERE syntax (~grep -E~)
+  - ~ripgrep~: uses ripgrep's own regexp engine; some Emacs regexp constructs
+    are not supported and may produce unexpected results
+  If you use ~:type regexp~ across multiple backends, verify the pattern in each
+  backend separately.
+
 ** Case sensitivity strategy
 
 Lumber runs all searches with ~case-fold-search~ set to ~nil~, then achieves
@@ -151,15 +185,36 @@ determines sensitivity under ~auto~ mode.
 
 * Persistence
 
-Named pattern sets are stored in memory via ~lumber-save-set~ and flushed to
-disk via ~lumber-persist-save~.  The file is loaded automatically at startup.
+Named pattern sets are saved to and loaded from disk directly:
 
-Default location: =~/.emacs.d/lumber-sets.eld=
+- ~lumber-save~ (~C-c l w~) — writes the active pattern set to ~lumber-sets.eld~.
+  Prompts for a name on first save; subsequent saves update the same named set.
+- ~lumber-load~ (~C-c l r~) — reads ~lumber-sets.eld~ and lets you select a
+  named set to load (skips the prompt if only one set is stored).
+
+Sets are /not/ loaded automatically at startup; call ~lumber-load~ when needed.
+
+Default file location: =~/.emacs.d/lumber-sets.eld=
 
 Override with:
 #+begin_src emacs-lisp
 (setq lumber-persist-file (locate-user-emacs-file "my-lumber-sets.eld"))
 #+end_src
+
+* Highlight application model
+
+Lumber maintains a single global active pattern set (~lumber--patterns~).
+Highlights are applied *per-buffer on demand* — only the buffer that is current
+at the time of a pattern mutation is updated.  Other open buffers are not
+affected automatically:
+
+- ~lumber-apply-highlights~ (~C-c l h~) — apply highlights in the current buffer.
+- ~lumber-clear-highlights~ (~C-c l H~) — remove lumber-managed highlights from
+  the current buffer.
+- Highlights in other open buffers remain unchanged when patterns change.
+
+If you have lumber highlights in multiple buffers and change a pattern, visit
+each buffer and call ~lumber-apply-highlights~ to refresh it.
 
 * License
 
